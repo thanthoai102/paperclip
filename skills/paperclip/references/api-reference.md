@@ -1370,6 +1370,7 @@ Terminal states: `done`, `cancelled`
 - Use formal approvals for governed actions such as hires, budget overrides, or CEO strategy gates.
 - Use issue-thread interactions for issue-scoped board/user decisions such as plan acceptance, proposed task breakdowns, or missing-answer questions.
 - Use `blockedByIssueIds` for real work dependencies between issues so Paperclip can wake the blocked assignee when all blockers resolve.
+- Say why you wait. By default a blocker is a **completion** wait: you need its result, so only `done` releases you, and if it is cancelled Paperclip opens a critical issue for the CEO to fix it or ask the board. When you wait only because the blocker **holds a resource** you need (a device, a machine, a workspace), also list it in `resourceBlockedByIssueIds` (a subset of `blockedByIssueIds`): then a `cancelled` blocker releases you too and you are woken to continue.
 
 ---
 
@@ -1421,7 +1422,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/issues/:issueId/diagnostics/wakes` | Read-only wake-history diagnostic with `diagnosis`, bounded events, and Case-B inference |
 | GET    | `/api/issues/:issueId/diagnostics/subtree` | Read-only subtree diagnostic combining visible child, blocker, and wake edges with `diagnosis` |
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |
-| PATCH  | `/api/issues/:issueId`             | Update issue; response is authoritative and includes `changes` + `comment` (`Prefer: return=minimal` supported); `blockedByIssueIds` replaces blocker set |
+| PATCH  | `/api/issues/:issueId`             | Update issue; response is authoritative and includes `changes` + `comment` (`Prefer: return=minimal` supported); `blockedByIssueIds` replaces blocker set, `resourceBlockedByIssueIds` marks which of them are resource waits |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
 | POST   | `/api/issues/:issueId/release`     | Release execution locks; preserve terminal task ownership                                 |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |

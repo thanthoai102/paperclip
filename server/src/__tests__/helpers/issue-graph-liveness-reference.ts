@@ -9,7 +9,7 @@
  * not optimise it. When a classification rule changes on purpose, make the same
  * change here.
  */
-import { getAgentWorkEligibility, isAgentInvokable } from "@paperclipai/shared";
+import { getAgentWorkEligibility, isAgentInvokable, isIssueBlockerResolved } from "@paperclipai/shared";
 import { buildIssueGraphLivenessIncidentKey } from "../../services/recovery/origins.js";
 import type {
   IssueGraphLivenessInput,
@@ -507,16 +507,30 @@ export function referenceClassifyIssueGraphLiveness(input: IssueGraphLivenessInp
     });
 
     if (blocker.status === "cancelled") {
+      const escalationCandidates: IssueLivenessOwnerCandidate[] = [];
+      const escalationSeen = new Set<string>();
+      for (const agent of orderedInvokableAgents(input.agents, agentsById, blocker.companyId)) {
+        if (agent.role.trim().toLowerCase() === "ceo") {
+          addOwnerCandidate(escalationCandidates, escalationSeen, agentsById, blocker.companyId, agent.id, "ceo", blocker.id);
+        }
+      }
+      for (const candidate of ownerCandidates) {
+        if (escalationSeen.has(candidate.agentId)) continue;
+        escalationSeen.add(candidate.agentId);
+        escalationCandidates.push(candidate);
+      }
       return finding({
         issue: source,
         state: "blocked_by_cancelled_issue",
-        reason: `${issueLabel(source)} is still blocked by cancelled issue ${issueLabel(blocker)}.`,
+        reason: `${issueLabel(source)} waits for ${issueLabel(blocker)} to complete, but ${issueLabel(blocker)} was cancelled.`,
         dependencyPath,
         recoveryIssue: blocker,
-        recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
-        recommendedOwnerCandidates: ownerCandidates,
+        recommendedOwnerCandidateAgentIds: escalationCandidates.map((candidate) => candidate.agentId),
+        recommendedOwnerCandidates: escalationCandidates,
         recommendedAction:
-          `Inspect ${issueLabel(blocker)} and either remove it from ${issueLabel(source)}'s blockers or replace it with an actionable unblock issue.`,
+          `Critical: analyse why ${issueLabel(blocker)} was cancelled while ${issueLabel(source)} still needs its result. ` +
+          `Either fix it yourself (reopen or redo ${issueLabel(blocker)}, replace it with an actionable unblock issue, or remove it from ${issueLabel(source)}'s blockers if the result is no longer needed), ` +
+          `or, when the decision belongs to the owner, ask the board to review it with a request_confirmation interaction and explain the options.`,
         blockerIssueId: blocker.id,
       });
     }
@@ -596,7 +610,7 @@ export function referenceClassifyIssueGraphLiveness(input: IssueGraphLivenessInp
     for (const relation of relations) {
       if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
       const blocker = issuesById.get(relation.blockerIssueId);
-      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+      if (!blocker || blocker.companyId !== source.companyId || isIssueBlockerResolved(blocker.status, relation.waitKind)) continue;
       const path = [...dependencyPath, blocker];
 
       if (blocker.status === "blocked") {
@@ -616,7 +630,7 @@ export function referenceClassifyIssueGraphLiveness(input: IssueGraphLivenessInp
     const hasUnresolvedBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
       if (relation.companyId !== issue.companyId) return false;
       const blocker = issuesById.get(relation.blockerIssueId);
-      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
+      return Boolean(blocker && blocker.companyId === issue.companyId && !isIssueBlockerResolved(blocker.status, relation.waitKind));
     });
     const shouldInspectBlockedChain = issue.status === "blocked" || (
       issue.status !== "done" &&

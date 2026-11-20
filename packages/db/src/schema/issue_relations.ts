@@ -11,6 +11,13 @@ export const issueRelations = pgTable(
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
     relatedIssueId: uuid("related_issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
     type: text("type").$type<"blocks">().notNull(),
+    /**
+     * Why the blocked issue waits. `completion`: it needs the blocker's result,
+     * so only a `done` blocker releases it and a cancelled one is escalated.
+     * `resource`: the blocker only holds something the blocked issue needs
+     * (a machine, a workspace, a device), so a `cancelled` blocker releases it too.
+     */
+    waitKind: text("wait_kind").$type<"completion" | "resource">().notNull().default("completion"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
     createdByUserId: text("created_by_user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

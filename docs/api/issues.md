@@ -139,6 +139,21 @@ Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, s
 
 Receipt values for `description` are limited to the first 200 characters and include `updated: true`. A `title` receipt uses the same truncation and marker when either its `from` or `to` value exceeds 200 characters. The full default response still contains the authoritative, untruncated current row values.
 
+### Why an issue waits: completion or resource
+
+Each blocker in `blockedByIssueIds` has a wait kind:
+
+| Wait kind | Meaning | Blocker `done` | Blocker `cancelled` |
+| --- | --- | --- | --- |
+| `completion` (default) | The issue needs the blocker's result | Releases the issue and wakes its assignee | Stays blocked; a critical recovery issue is assigned to the CEO agent to fix it or ask the board |
+| `resource` | The blocker only holds something the issue needs (a device, a machine, a workspace) | Releases the issue and wakes its assignee | Releases the issue and wakes its assignee |
+
+Mark resource waits with `resourceBlockedByIssueIds`, a subset of `blockedByIssueIds` sent in the same request. When `blockedByIssueIds` is sent without it, blockers that stay in the set keep their recorded wait kind and new ones wait for completion.
+
+```json
+{ "status": "blocked", "blockedByIssueIds": ["<image-test>"], "resourceBlockedByIssueIds": ["<image-test>"] }
+```
+
 When the request includes `blockedByIssueIds`, the response also includes:
 
 - top-level `blockedByIssueIds`, echoing the normalized committed ID array

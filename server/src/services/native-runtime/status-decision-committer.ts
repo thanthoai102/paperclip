@@ -2616,6 +2616,36 @@ export async function commitNativeStatusDecision(input: {
       }
     }
 
+    // A cancelled blocker releases the issues that waited on it only for a
+    // resource; readiness keeps completion waits blocked for escalation.
+    if (input.decision.statusAction === "cancelled" && issue.status !== "cancelled") {
+      const dependents = await issueService(tx as unknown as Db).listWakeableBlockedDependents(input.issueId);
+      for (const dependent of dependents) {
+        const wakeId = await enqueueWake({
+          tx: tx as unknown as Db,
+          companyId: input.companyId,
+          issueId: dependent.id,
+          agentId: dependent.assigneeAgentId,
+          reason: "issue_blockers_resolved",
+          idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
+            dependentIssueId: dependent.id,
+            resolvedBlockerIssueId: input.issueId,
+          }),
+          payload: {
+            resolvedBlockerIssueId: input.issueId,
+            blockerIssueIds: dependent.blockerIssueIds,
+            mutation: "resource_blocker_cancelled",
+          },
+        });
+        materialized.push({
+          effectKind: "dependency_wake",
+          targetType: "agent_wakeup_request",
+          targetId: wakeId,
+          payload: { dependentIssueId: dependent.id, resolvedBlockerIssueId: input.issueId },
+        });
+      }
+    }
+
     for (const [index, effect] of materialized.entries()) {
       await tx
         .insert(statusDecisionEffects)

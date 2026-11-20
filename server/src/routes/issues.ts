@@ -315,6 +315,7 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { escalateCancelledCompletionBlocker } from "../services/cancelled-blocker-escalation.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import {
@@ -3693,6 +3694,40 @@ export function issueRoutes(
       sourceRun?.companyId === comment.companyId &&
       sourceRun.agentId === assigneeAgentId
     );
+  };
+  // A blocker cancelled while other issues wait for its result strands them:
+  // open a critical recovery issue for the CEO and wake it. Best effort, so a
+  // failed escalation never fails the cancellation that triggered it.
+  const escalateCancelledBlockerToCeo = async (
+    blocker: { id: string; companyId: string },
+    actor: { actorType: "agent" | "user" | "system" | string; actorId: string; agentId?: string | null },
+  ) => {
+    try {
+      const escalations = await escalateCancelledCompletionBlocker(db, {
+        companyId: blocker.companyId,
+        blockerIssueId: blocker.id,
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      });
+      for (const escalation of escalations) {
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue: escalation,
+          reason: "issue_assigned",
+          mutation: "cancelled_blocker_escalation",
+          contextSource: "issue.cancelled_blocker_escalation",
+          requestedByActorType: "system",
+          requestedByActorId: "cancelled_blocker_escalation",
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err, companyId: blocker.companyId, blockerIssueId: blocker.id },
+        "failed to escalate cancelled completion blocker",
+      );
+    }
   };
   const enqueueStalledReviewDecisionWakeup =
     opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
@@ -14652,7 +14687,7 @@ export function issueRoutes(
         && !(await resolveManagedIssueForPrivacy(req, res, existing))) return;
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
-        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
+        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "resourceBlockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
       if (mcpParticipationChange) await assertMcpTaskParticipation(db, existing);
 
       assertNoAgentHostWorkspaceCommandMutation(
@@ -16822,7 +16857,11 @@ export function issueRoutes(
 
         const becameDone =
           existing.status !== "done" && issue.status === "done";
-        if (becameDone) {
+        // A cancelled blocker releases only the issues that waited on it for a
+        // resource; readiness keeps completion waits blocked (and escalated).
+        const becameCancelled =
+          existing.status !== "cancelled" && issue.status === "cancelled";
+        if (becameDone || becameCancelled) {
           const dependents = await svc.listWakeableBlockedDependents(issue.id);
           for (const dependent of dependents) {
             await addDependencyResolvedWakeup({
@@ -16832,9 +16871,12 @@ export function issueRoutes(
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
               source: "issue.blockers_resolved",
-              mutation: "blocker_done",
+              mutation: becameDone ? "blocker_done" : "resource_blocker_cancelled",
             });
           }
+        }
+        if (becameCancelled) {
+          await escalateCancelledBlockerToCeo(issue, actor);
         }
 
         const restoredBlockedReadyDependency = shouldWakeOnRestoredBlockedDependency({
@@ -20254,7 +20296,11 @@ export function issueRoutes(
         const becameDone =
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";
-        if (becameDone) {
+        // A cancelled blocker releases only resource waits (see readiness).
+        const becameCancelled =
+          issueBeforeCommentDecision.status !== "cancelled" &&
+          currentIssue.status === "cancelled";
+        if (becameDone || becameCancelled) {
           const dependents = await svc.listWakeableBlockedDependents(
             currentIssue.id,
           );
@@ -20267,6 +20313,9 @@ export function issueRoutes(
               blockedTransitionAt: dependent.blockedTransitionAt,
             });
           }
+        }
+        if (becameCancelled) {
+          await escalateCancelledBlockerToCeo(currentIssue, actor);
         }
 
         const becameTerminal =

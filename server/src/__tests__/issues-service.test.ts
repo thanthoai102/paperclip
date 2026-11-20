@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -4600,6 +4600,77 @@ const dependencyTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ISSU
       }),
     ]);
     expect(wakeable[0]?.blockerIssueIds).toHaveLength(2);
+  });
+
+  it("releases a dependent when a resource blocker is cancelled but not a completion blocker", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, assigneeAgentId);
+
+    const resourceBlocker = randomUUID();
+    const completionBlocker = randomUUID();
+    const waitsForResource = randomUUID();
+    const waitsForResult = randomUUID();
+    await db.insert(issues).values([
+      { id: resourceBlocker, companyId, title: "Image test holding the GPU", status: "in_progress", priority: "medium" },
+      { id: completionBlocker, companyId, title: "Image test whose result is needed", status: "in_progress", priority: "medium" },
+      { id: waitsForResource, companyId, title: "Build assets on the GPU", status: "blocked", priority: "medium", assigneeAgentId },
+      { id: waitsForResult, companyId, title: "Build assets from test output", status: "blocked", priority: "medium", assigneeAgentId },
+    ]);
+
+    await svc.update(waitsForResource, {
+      blockedByIssueIds: [resourceBlocker],
+      resourceBlockedByIssueIds: [resourceBlocker],
+    });
+    await svc.update(waitsForResult, { blockedByIssueIds: [completionBlocker] });
+
+    const kinds = await db
+      .select({ blocked: issueRelations.relatedIssueId, waitKind: issueRelations.waitKind })
+      .from(issueRelations)
+      .where(inArray(issueRelations.relatedIssueId, [waitsForResource, waitsForResult]));
+    expect(Object.fromEntries(kinds.map((row) => [row.blocked, row.waitKind]))).toEqual({
+      [waitsForResource]: "resource",
+      [waitsForResult]: "completion",
+    });
+
+    await svc.update(resourceBlocker, { status: "cancelled" });
+    await svc.update(completionBlocker, { status: "cancelled" });
+
+    expect(await svc.listWakeableBlockedDependents(resourceBlocker)).toEqual([
+      expect.objectContaining({ id: waitsForResource, assigneeAgentId, blockerIssueIds: [resourceBlocker] }),
+    ]);
+    expect(await svc.listWakeableBlockedDependents(completionBlocker)).toEqual([]);
+  });
+
+  it("keeps a blocker's wait kind when the blocker set is rewritten without one", async () => {
+    const companyId = randomUUID();
+    await seedIssueCompany(db, companyId);
+
+    const blockerA = randomUUID();
+    const blockerB = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerA, companyId, title: "Holds the device", status: "todo", priority: "medium" },
+      { id: blockerB, companyId, title: "Produces the input", status: "todo", priority: "medium" },
+      { id: blockedIssueId, companyId, title: "Blocked issue", status: "blocked", priority: "medium" },
+    ]);
+
+    await svc.update(blockedIssueId, { blockedByIssueIds: [blockerA], resourceBlockedByIssueIds: [blockerA] });
+    await svc.update(blockedIssueId, { blockedByIssueIds: [blockerA, blockerB] });
+
+    const rows = await db
+      .select({ blocker: issueRelations.issueId, waitKind: issueRelations.waitKind })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(Object.fromEntries(rows.map((row) => [row.blocker, row.waitKind]))).toEqual({
+      [blockerA]: "resource",
+      [blockerB]: "completion",
+    });
+
+    await expect(
+      svc.update(blockedIssueId, { blockedByIssueIds: [blockerB], resourceBlockedByIssueIds: [blockerA] }),
+    ).rejects.toThrow("Resource blockers must also be listed in blockedByIssueIds");
   });
 
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {

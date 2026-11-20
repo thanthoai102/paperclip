@@ -819,6 +819,12 @@ const createIssueBaseSchema = z.object({
   visibility: z.enum(["open", "private"]).optional().default("open"),
   parentId: z.string().guid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().guid()).optional(),
+  /**
+   * The blockers in blockedByIssueIds this issue waits on only for a resource
+   * they hold. A cancelled resource blocker releases the issue; a cancelled
+   * completion blocker is escalated to the CEO. Requires blockedByIssueIds.
+   */
+  resourceBlockedByIssueIds: z.array(z.string().guid()).optional(),
   unblockDescriptor: z
     .object({
       owner: z.union([

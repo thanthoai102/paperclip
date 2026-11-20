@@ -1,4 +1,4 @@
-import { getAgentWorkEligibility, type AgentWorkEligibility } from "@paperclipai/shared";
+import { getAgentWorkEligibility, isIssueBlockerResolved, type AgentWorkEligibility } from "@paperclipai/shared";
 import { buildIssueGraphLivenessIncidentKey } from "./origins.js";
 
 export type IssueLivenessSeverity = "warning" | "critical";
@@ -37,6 +37,8 @@ export interface IssueLivenessRelationInput {
   companyId: string;
   blockerIssueId: string;
   blockedIssueId: string;
+  /** `issue_relations.wait_kind`; absent means `completion`. */
+  waitKind?: string | null;
 }
 
 export interface IssueLivenessAgentInput {
@@ -96,6 +98,7 @@ export type IssueLivenessOwnerCandidateReason =
   | "stalled_blocker_assignee"
   | "assignee_reporting_chain"
   | "creator_reporting_chain"
+  | "ceo"
   | "root_agent"
   | "ordered_invokable_fallback";
 
@@ -510,6 +513,27 @@ function ownerCandidatesForRecoveryIssue(
   return candidates;
 }
 
+/** The company's invokable CEO agents first, then the usual candidates. */
+function ceoFirstOwnerCandidates(
+  issue: IssueLivenessIssueInput,
+  index: IssueGraphLivenessIndex,
+  fallback: IssueLivenessOwnerCandidate[],
+) {
+  const candidates: IssueLivenessOwnerCandidate[] = [];
+  const seen = new Set<string>();
+  for (const agent of index.invokableAgents(issue.companyId)) {
+    if (agent.role.trim().toLowerCase() === "ceo") {
+      addOwnerCandidate(candidates, seen, index, issue.companyId, agent.id, "ceo", issue.id);
+    }
+  }
+  for (const candidate of fallback) {
+    if (seen.has(candidate.agentId)) continue;
+    seen.add(candidate.agentId);
+    candidates.push(candidate);
+  }
+  return candidates;
+}
+
 function incidentKey(input: {
   companyId: string;
   issueId: string;
@@ -683,16 +707,22 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     });
 
     if (blocker.status === "cancelled") {
+      // A cancelled completion blocker can never deliver the result the blocked
+      // issue waits for: a critical incident for the CEO first. (A cancelled
+      // resource blocker is resolved and never reaches this leaf.)
+      const escalationCandidates = ceoFirstOwnerCandidates(blocker, index, ownerCandidates);
       return finding({
         issue: source,
         state: "blocked_by_cancelled_issue",
-        reason: `${issueLabel(source)} is still blocked by cancelled issue ${issueLabel(blocker)}.`,
+        reason: `${issueLabel(source)} waits for ${issueLabel(blocker)} to complete, but ${issueLabel(blocker)} was cancelled.`,
         dependencyPath,
         recoveryIssue: blocker,
-        recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
-        recommendedOwnerCandidates: ownerCandidates,
+        recommendedOwnerCandidateAgentIds: escalationCandidates.map((candidate) => candidate.agentId),
+        recommendedOwnerCandidates: escalationCandidates,
         recommendedAction:
-          `Inspect ${issueLabel(blocker)} and either remove it from ${issueLabel(source)}'s blockers or replace it with an actionable unblock issue.`,
+          `Critical: analyse why ${issueLabel(blocker)} was cancelled while ${issueLabel(source)} still needs its result. ` +
+          `Either fix it yourself (reopen or redo ${issueLabel(blocker)}, replace it with an actionable unblock issue, or remove it from ${issueLabel(source)}'s blockers if the result is no longer needed), ` +
+          `or, when the decision belongs to the owner, ask the board to review it with a request_confirmation interaction and explain the options.`,
         blockerIssueId: blocker.id,
       });
     }
@@ -772,7 +802,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     for (const relation of relations) {
       if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
       const blocker = issuesById.get(relation.blockerIssueId);
-      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+      if (!blocker || blocker.companyId !== source.companyId || isIssueBlockerResolved(blocker.status, relation.waitKind)) continue;
       const path = [...dependencyPath, blocker];
 
       if (blocker.status === "blocked") {
@@ -792,7 +822,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const hasUnresolvedBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
       if (relation.companyId !== issue.companyId) return false;
       const blocker = issuesById.get(relation.blockerIssueId);
-      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
+      return Boolean(blocker && blocker.companyId === issue.companyId && !isIssueBlockerResolved(blocker.status, relation.waitKind));
     });
     const shouldInspectBlockedChain = issue.status === "blocked" || (
       issue.status !== "done" &&
