@@ -30,7 +30,8 @@ export const resolvedDependencyCandidate = sql`exists (select 1 from ${issueRela
     and not exists (select 1 from ${issueRelations} r inner join ${issues} blocker
       on blocker.id = r.issue_id and blocker.company_id = r.company_id
       where r.company_id = ${issues.companyId} and r.related_issue_id = ${issues.id}
-        and r.type = 'blocks' and blocker.status <> 'done' offset 0)`;
+        and r.type = 'blocks' and blocker.status <> 'done'
+        and not (blocker.status = 'cancelled' and r.wait_kind = 'resource') offset 0)`;
 
 export function registerIssueRecoveryWork(
   db: Db,

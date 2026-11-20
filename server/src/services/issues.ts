@@ -40,7 +40,7 @@ import { automaticReadRecoveryCleanupCondition, directHumanCommentCondition, hum
 import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js";
 import { type AuthorizationActor, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
 import { assertExecutionWorkspaceRecordAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-access.js";
-import { type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
+import { type TaskWorkspaceSelection, type TaskWorkspaceIntent, isReleasedResourceBlocker } from "@paperclipai/shared";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
@@ -2076,6 +2076,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   conversationHandoff?: { conversationId: string; sessionGeneration: number };
   labelIds?: string[];
   blockedByIssueIds?: string[];
+  /** Subset of blockedByIssueIds the issue waits on only for a resource they hold. */
+  resourceBlockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
   skipExecutionWorkspaceInheritance?: boolean;
   watchdog?: { agentId: string; instructions?: string | null } | null;
@@ -2781,6 +2783,7 @@ async function listIssueDependencyReadinessMap(
       blockerIssueId: issueRelations.issueId,
       blockerStatus: issues.status,
       blockerExecutionWorkspaceId: issues.executionWorkspaceId,
+      waitKind: issueRelations.waitKind,
     })
     .from(issueRelations)
     .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2824,8 +2827,14 @@ async function listIssueDependencyReadinessMap(
       readinessMap.get(row.issueId) ??
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
+    // Done blockers resolve dependents. A cancelled blocker resolves only a
+    // resource wait (it no longer holds the resource); a cancelled completion
+    // blocker stays unresolved and is escalated by issue-graph liveness until an
+    // operator removes or replaces the blocker relationship explicitly.
+    if (isReleasedResourceBlocker(row.blockerStatus, row.waitKind)) {
+      readinessMap.set(row.issueId, current);
+      continue;
+    }
     if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
@@ -6050,6 +6059,7 @@ async function listIssueBlockedInboxAttentionMap(
           companyId: issueRelations.companyId,
           blockerIssueId: issueRelations.issueId,
           blockedIssueId: issueRelations.relatedIssueId,
+          waitKind: issueRelations.waitKind,
         })
         .from(issueRelations)
         .where(
@@ -6077,6 +6087,7 @@ async function listIssueBlockedInboxAttentionMap(
     companyId: string;
     blockerIssueId: string;
     blockedIssueId: string;
+    waitKind: string;
   }>;
   const companyAgents = companyAgentRows as Array<{
     id: string;
@@ -8019,10 +8030,18 @@ export function issueService(db: Db) {
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any,
+    /**
+     * Blockers this issue waits on only for a resource they hold. Omitted, every
+     * kept blocker keeps its recorded wait kind and a new one waits for completion.
+     */
+    resourceBlockerIssueIds?: string[],
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
+    }
+    if (resourceBlockerIssueIds?.some((candidate) => !deduped.includes(candidate))) {
+      throw unprocessable("Resource blockers must also be listed in blockedByIssueIds");
     }
 
     if (deduped.length > 0) {
@@ -8050,6 +8069,25 @@ export function issueService(db: Db) {
     await notifyIssueAttentionRetentionWork(dbOrTx, { companyId, issueId });
     await notifyIssueGraphRecovery(dbOrTx, { companyId, issueId });
     await notifyDeferredExecutionEligibility(dbOrTx, { companyId });
+    const resourceBlockers = new Set<string>(
+      resourceBlockerIssueIds ??
+        (deduped.length === 0
+          ? []
+          : await dbOrTx
+              .select({ blockerIssueId: issueRelations.issueId })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, companyId),
+                  eq(issueRelations.relatedIssueId, issueId),
+                  eq(issueRelations.type, "blocks"),
+                  eq(issueRelations.waitKind, "resource"),
+                ),
+              )
+              .then((rows: Array<{ blockerIssueId: string }>) =>
+                rows.map((row) => row.blockerIssueId),
+              )),
+    );
     await dbOrTx
       .delete(issueRelations)
       .where(
@@ -8068,6 +8106,7 @@ export function issueService(db: Db) {
         issueId: blockerIssueId,
         relatedIssueId: issueId,
         type: "blocks",
+        waitKind: resourceBlockers.has(blockerIssueId) ? "resource" : "completion",
         createdByAgentId: actor.agentId ?? null,
         createdByUserId: actor.userId ?? null,
       })),
@@ -10616,6 +10655,7 @@ export function issueService(db: Db) {
         generateConversationTitle,
         labelIds: inputLabelIds,
         blockedByIssueIds,
+        resourceBlockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
         skipExecutionWorkspaceInheritance,
         watchdog,
@@ -11280,6 +11320,9 @@ export function issueService(db: Db) {
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
+        if (resourceBlockedByIssueIds !== undefined && blockedByIssueIds === undefined) {
+          throw unprocessable("resourceBlockedByIssueIds requires blockedByIssueIds");
+        }
         if (blockedByIssueIds !== undefined) {
           await syncBlockedByIssueIds(
             issue.id,
@@ -11290,6 +11333,7 @@ export function issueService(db: Db) {
               userId: issueData.createdByUserId ?? null,
             },
             tx,
+            resourceBlockedByIssueIds,
           );
         }
         if (initialPlan?.trim()) {
@@ -11664,6 +11708,7 @@ export function issueService(db: Db) {
       data: Partial<typeof issues.$inferInsert> & {
         labelIds?: string[];
         blockedByIssueIds?: string[];
+        resourceBlockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorRunId?: string | null;
         /** Server-owned transfer being applied; never accepted from HTTP input. */
@@ -11764,6 +11809,7 @@ export function issueService(db: Db) {
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
+        resourceBlockedByIssueIds,
         actorAgentId,
         actorRunId,
         caseHandoffId,
@@ -12175,6 +12221,9 @@ export function issueService(db: Db) {
           });
           assertHandedOffRunTaskOwnership(actorRun, receiptExisting);
         }
+        if (resourceBlockedByIssueIds !== undefined && blockedByIssueIds === undefined) {
+          throw unprocessable("resourceBlockedByIssueIds requires blockedByIssueIds");
+        }
         if (blockedByIssueIds !== undefined) {
           await assertOnboardingFirstTaskDependenciesAllowed(tx as Db, {
             companyId: receiptExisting.companyId,
@@ -12540,6 +12589,7 @@ export function issueService(db: Db) {
               userId: actorUserId ?? null,
             },
             tx,
+            resourceBlockedByIssueIds,
           );
         }
         const enteredBlocked = updated.status === "blocked" && receiptExisting.status !== "blocked";

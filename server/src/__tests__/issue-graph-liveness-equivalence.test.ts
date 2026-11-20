@@ -240,6 +240,37 @@ describe("issue graph liveness: one index for every task of a classification", (
     expect(kinds("waiting-external")).toEqual(["external_response"]);
   });
 
+  it("releases resource waits on a cancelled blocker and escalates completion waits to the CEO first", () => {
+    const ceo = { ...agent(4, null), role: "ceo" };
+    const agents = [agent(0, null), agent(1, "agent-0"), ceo];
+    const task = (id: string, status: string): IssueLivenessIssueInput => ({
+      id, companyId: COMPANIES[0]!, identifier: id.toUpperCase(), title: id, status, assigneeAgentId: "agent-1",
+      assigneeUserId: null, createdByAgentId: "agent-1", createdByUserId: null, executionState: null,
+    });
+    const input: IssueGraphLivenessInput = {
+      now: NOW,
+      agents,
+      issues: [task("cancelled-test", "cancelled"), task("waits-for-gpu", "blocked"), task("waits-for-result", "blocked")],
+      relations: [
+        { companyId: COMPANIES[0]!, blockerIssueId: "cancelled-test", blockedIssueId: "waits-for-gpu", waitKind: "resource" },
+        { companyId: COMPANIES[0]!, blockerIssueId: "cancelled-test", blockedIssueId: "waits-for-result", waitKind: "completion" },
+      ],
+      activeRuns: [],
+      queuedWakeRequests: [],
+      pendingInteractions: [],
+      pendingApprovals: [],
+      openRecoveryIssues: [],
+    };
+
+    const findings = classifyIssueGraphLiveness(input);
+    expect(findings).toEqual(referenceClassifyIssueGraphLiveness(input));
+    expect(findings.map((finding) => [finding.issueId, finding.state])).toEqual([
+      ["waits-for-result", "blocked_by_cancelled_issue"],
+    ]);
+    expect(findings[0]?.recommendedOwnerAgentId).toBe(ceo.id);
+    expect(findings[0]?.recommendedOwnerCandidates[0]?.reason).toBe("ceo");
+  });
+
   it("reads each agent and each path a number of times that does not grow with the reviews", () => {
     const few = countedInput(20), many = countedInput(400);
     const fewFindings = classifyIssueGraphLiveness(few.input), manyFindings = classifyIssueGraphLiveness(many.input);
